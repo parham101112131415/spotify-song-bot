@@ -5,6 +5,7 @@ Pipeline (verified 2026-10-12):
   yt-dlp ytsearch1 -> mp3 (imageio-ffmpeg) -> mutagen tags + cover -> send_audio
 """
 import logging
+import asyncio
 import os
 import re
 import json
@@ -170,9 +171,9 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pass
         tmpd = tempfile.mkdtemp(prefix="spot_", dir="/tmp")
         out = os.path.join(tmpd, "song.mp3")
-        await ctx.application.loop.run_in_executor(
+        await asyncio.get_running_loop().run_in_executor(
             None, lambda: download_mp3(f"{artist} {title}", out))
-        await ctx.application.loop.run_in_executor(
+        await asyncio.get_running_loop().run_in_executor(
             None, lambda: tag_mp3(out, title, artist, cover_bytes))
         await status.edit_text("می‌فرستمش… 📤")
         btn = InlineKeyboardMarkup(
@@ -219,12 +220,12 @@ async def on_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sid = (q.data or "").split(":", 1)[-1]
     await q.message.reply_text("دارم متن رو پیدا می‌کنم… 📝")
     try:
-        title, artist, _ = await ctx.application.loop.run_in_executor(
+        title, artist, _ = await asyncio.get_running_loop().run_in_executor(
             None, spotify_track_info, sid)
         if not title:
             await q.message.reply_text("نتونستم اسم آهنگ رو بگیرم 😕")
             return
-        txt = await ctx.application.loop.run_in_executor(
+        txt = await asyncio.get_running_loop().run_in_executor(
             None, get_lyrics, title, artist)
         if not txt:
             await q.message.reply_text(
