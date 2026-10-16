@@ -29,6 +29,10 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 SP_RE = re.compile(r"open\.spotify\.com/(track|album|playlist|artist)/([A-Za-z0-9]+)")
 YT_RE = re.compile(r"(youtube\.com/watch\?v=|youtu\.be/)([A-Za-z0-9_-]{11})")
+SC_RE = re.compile(r"soundcloud\.com/([A-Za-z0-9_.\-/]+)")
+APPLE_RE = re.compile(r"music\.apple\.com/[a-z]{2}/(?:album|song)/[^/\s]+/(\d+)(?:\?i=(\d+))?")
+DEEZER_RE = re.compile(r"deezer\.com/(?:[a-z]{2}/)?track/(\d+)")
+URL_RE = re.compile(r"https?://[^\s]+")
 
 DATA_DIR = os.environ.get("DATA_DIR", "/tmp/spotibot_data")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
@@ -79,16 +83,19 @@ def set_user_quality(user_id, quality):
     _save_json(SETTINGS_FILE, s)
 
 
-def record_download(user_id):
+def record_download(user_id, artist=None):
     st = _load_json(STATS_FILE, {"total_downloads": 0, "users": {}})
     st["total_downloads"] = st.get("total_downloads", 0) + 1
     users = st.setdefault("users", {})
-    u = users.get(str(user_id), {"count": 0, "first": None, "last": None})
+    u = users.get(str(user_id), {"count": 0, "first": None, "last": None, "artists": {}})
     now = datetime.utcnow().isoformat(timespec="seconds")
     u["count"] += 1
     u["last"] = now
     if not u.get("first"):
         u["first"] = now
+    if artist:
+        arts = u.setdefault("artists", {})
+        arts[artist] = arts.get(artist, 0) + 1
     users[str(user_id)] = u
     _save_json(STATS_FILE, st)
 
@@ -207,6 +214,80 @@ def fmt_duration(sec):
         return ""
 
 
+def apple_music_info(url):
+    """Extract track metadata from an Apple Music URL via iTunes Lookup API."""
+    m = APPLE_RE.search(url)
+    if not m:
+        return None
+    track_id = m.group(2) or m.group(1)
+    try:
+        raw = http_get(f"https://itunes.apple.com/lookup?id={track_id}&entity=song", timeout=20)
+        d = json.loads(raw.decode("utf-8", "ignore"))
+        res = (d.get("results") or [{}])[0]
+        if not res.get("trackName"):
+            return None
+        art = (res.get("artworkUrl100") or "").replace("100x100bb", "600x600bb")
+        return {"title": res.get("trackName"), "artist": res.get("artistName") or "Unknown",
+                "cover_url": art or None, "album": res.get("collectionName"),
+                "year": (res.get("releaseDate") or "")[:4] or None,
+                "duration": fmt_duration((res.get("trackTimeMillis") or 0) // 1000),
+                "track_no": res.get("trackNumber"), "sid": f"am:{track_id}"}
+    except Exception as e:
+        log.warning("apple music lookup failed: %s", e)
+    return None
+
+
+def deezer_track_info(track_id):
+    """Track metadata via public Deezer API (no auth)."""
+    try:
+        raw = http_get(f"https://api.deezer.com/track/{track_id}", timeout=20)
+        d = json.loads(raw.decode("utf-8", "ignore"))
+        if not d.get("title"):
+            return None
+        artist = (d.get("artist") or {}).get("name") or "Unknown"
+        album = d.get("album") or {}
+        return {"title": d.get("title"), "artist": artist,
+                "cover_url": album.get("cover_big") or album.get("cover"),
+                "album": album.get("title"),
+                "year": (d.get("release_date") or "")[:4] or None,
+                "duration": fmt_duration(d.get("duration") or 0),
+                "track_no": d.get("track_position"), "sid": f"dz:{track_id}"}
+    except Exception as e:
+        log.warning("deezer lookup failed: %s", e)
+    return None
+
+
+def soundcloud_info(url):
+    """Track metadata via yt-dlp (no download)."""
+    try:
+        r = subprocess.run(
+            ["yt-dlp", url, "--print", "%(title)s|%(uploader)s|%(duration_string)s|%(thumbnail)s",
+             "--no-playlist", "-q", "--js-runtimes", "deno,node"],
+            capture_output=True, text=True, timeout=60)
+        line = (r.stdout or "").strip().splitlines()
+        if not line:
+            return None
+        parts = line[0].split("|")
+        title = parts[0].strip() if len(parts) > 0 else ""
+        if not title or title == "NA":
+            return None
+        # SoundCloud titles are often "Artist - Title"
+        artist, t = "Unknown", title
+        if " - " in title:
+            artist, t = [x.strip() for x in title.split(" - ", 1)]
+        import hashlib as _hl
+        skey = _hl.md5(url.encode()).hexdigest()[:10]
+        _pending["sc" + skey] = url
+        return {"title": t, "artist": artist or "Unknown",
+                "cover_url": parts[3].strip() if len(parts) > 3 and parts[3].strip() != "NA" else None,
+                "album": None, "year": None,
+                "duration": parts[2].strip() if len(parts) > 2 else None,
+                "track_no": None, "sid": f"sc:{skey}", "sc_url": url}
+    except Exception as e:
+        log.warning("soundcloud info failed: %s", e)
+    return None
+
+
 def build_caption(info, quality):
     lines = [f"🎵 {info['artist']} – {info['title']}"]
     if info.get("album"):
@@ -225,9 +306,11 @@ def build_caption(info, quality):
 
 
 # ---------------------------------------------------------------- yt-dlp ----
-def download_mp3(query, out_mp3, quality="192", progress_cb=None):
-    """Download + convert to mp3. progress_cb(pct:int) called on milestones."""
-    base_cmd = ["yt-dlp", "ytsearch1:" + query, "-x", "--audio-format", "mp3",
+def download_mp3(query, out_mp3, quality="192", progress_cb=None, direct_url=None):
+    """Download + convert to mp3. progress_cb(pct:int) called on milestones.
+    If direct_url is given, download it instead of ytsearch1:query."""
+    target = direct_url if direct_url else "ytsearch1:" + query
+    base_cmd = ["yt-dlp", target, "-x", "--audio-format", "mp3",
                 "--audio-quality", f"{quality}K",
                 "--ffmpeg-location", FF, "-o", out_mp3.replace(".mp3", ".%(ext)s"),
                 "--no-playlist", "--js-runtimes", "deno,node",
@@ -351,6 +434,48 @@ def get_lyrics(title, artist):
     return None
 
 
+def get_synced_lyrics(title, artist):
+    """Return LRC-format synced lyrics string or None (LRClib)."""
+    q = urllib.parse.urlencode({"track_name": title, "artist_name": artist})
+    for endpoint in (f"https://lrclib.net/api/get?{q}", f"https://lrclib.net/api/search?{q}"):
+        try:
+            d = json.loads(http_get(endpoint, timeout=20))
+            items = d if isinstance(d, list) else [d]
+            for it in items:
+                lrc = (it.get("syncedLyrics") or "").strip()
+                if lrc:
+                    return lrc
+        except Exception as e:
+            log.warning("lrclib synced failed: %s", e)
+    return None
+
+
+def translate_text(text, src="en", dst="fa", chunk_size=450):
+    """Translate long text via MyMemory (free, chunked). Returns str or None."""
+    out = []
+    # split into <=chunk_size pieces on line boundaries
+    cur = ""
+    pieces = []
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > chunk_size:
+            pieces.append(cur)
+            cur = line
+        else:
+            cur = (cur + "\n" + line) if cur else line
+    if cur:
+        pieces.append(cur)
+    for p in pieces[:20]:  # cap to avoid API abuse
+        try:
+            q = urllib.parse.urlencode({"q": p, "langpair": f"{src}|{dst}"})
+            d = json.loads(http_get(f"https://api.mymemory.translated.net/get?{q}", timeout=25))
+            t = ((d.get("responseData") or {}).get("translatedText") or "").strip()
+            out.append(t if t else p)
+        except Exception as e:
+            log.warning("translate chunk failed: %s", e)
+            out.append(p)
+    return "\n".join(out) if out else None
+
+
 def chunk(text, n=4000):
     out, cur = [], ""
     for line in text.split("\n"):
@@ -366,6 +491,7 @@ def chunk(text, n=4000):
 
 # ---------------------------------------------------------------- queue -----
 _user_locks = {}
+_pending = {}  # short key -> info dict (for callbacks with long payloads)
 
 
 def user_lock(uid):
@@ -405,7 +531,9 @@ async def send_track(chat_id, info, quality, ctx, reply_to=None, extra_buttons=N
         def on_prog(pct):
             last_pct["v"] = pct
 
-        await loop.run_in_executor(None, lambda: download_mp3(f"{info['artist']} {info['title']}", out, quality, on_prog))
+        await loop.run_in_executor(None, lambda: download_mp3(
+            f"{info['artist']} {info['title']}", out, quality, on_prog,
+            direct_url=info.get("sc_url") or (f"https://www.youtube.com/watch?v={info['ytid']}" if info.get("ytid") else None)))
         if status and last_pct["v"]:
             try:
                 await status.edit_text(f"🎵 {info['artist']} – {info['title']}\n✅ دانلود شد، دارم می‌فرستم…")
@@ -423,6 +551,8 @@ async def send_track(chat_id, info, quality, ctx, reply_to=None, extra_buttons=N
         sid = info.get("sid", "")
         buttons = [
             [InlineKeyboardButton("متن آهنگ 📝", callback_data=f"lyr:{sid}"),
+             InlineKeyboardButton("🌐 ترجمه", callback_data=f"tr:{sid}")],
+            [InlineKeyboardButton("📄 فایل LRC", callback_data=f"lrc:{sid}"),
              InlineKeyboardButton("🎧 مشابه", callback_data=f"sim:{sid}")],
             [InlineKeyboardButton("⚡ تند", callback_data=f"nc:{quality}:{sid}"),
              InlineKeyboardButton("🐌 کند", callback_data=f"sl:{quality}:{sid}")],
@@ -440,7 +570,7 @@ async def send_track(chat_id, info, quality, ctx, reply_to=None, extra_buttons=N
                     await ctx.bot.send_audio(chat_id=chat_id, **kwargs)
             else:
                 await ctx.bot.send_audio(chat_id=chat_id, **kwargs)
-        record_download(chat_id)
+        record_download(chat_id, info.get("artist"))
         return True
     except Exception as e:
         log.exception("send_track failed")
@@ -529,8 +659,10 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "سلام عشقم 🎵\n"
-        "لینک آهنگ/آلبوم/پلی‌لیست اسپاتیفای بفرست، یا فقط اسم آهنگ رو بنویس.\n"
-        "با /settings کیفیت پیش‌فرضت رو ست کن.")
+        "لینک بفرست (اسپاتیفای، اپل موزیک، دیزر، ساندکلاد، یوتیوب)\n"
+        "یا فقط اسم آهنگ رو بنویس.\n"
+        "می‌تونی چند تا لینک رو یه‌جا بفرستی!\n"
+        "با /settings کیفیت پیش‌فرضت رو ست کن، با /mystats آمارت رو ببین.")
 
 
 async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -559,30 +691,121 @@ async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def mystats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.message.from_user.id)
+    st = _load_json(STATS_FILE, {"total_downloads": 0, "users": {}})
+    u = st.get("users", {}).get(uid, {"count": 0, "artists": {}})
+    arts = sorted((u.get("artists") or {}).items(), key=lambda kv: kv[1], reverse=True)[:5]
+    lines = ["📊 آمار تو", f"🎵 دانلودها: {u.get('count', 0)}"]
+    if arts:
+        lines.append("🎤 خواننده‌های پرتکرار:")
+        for name, c in arts:
+            lines.append(f"• {name}: {c}")
+    await update.message.reply_text("\n".join(lines))
+
+
 # ---------------------------------------------------------------- text ------
+async def classify_url(url):
+    """Return (action, payload) for a URL. action: track|collection|direct|search."""
+    m = SP_RE.search(url)
+    if m:
+        kind, sid = m.group(1), m.group(2)
+        if kind == "track":
+            return ("sp_track", sid)
+        if kind in ("album", "playlist"):
+            return ("sp_collection", (kind, sid))
+        return ("unsupported", "artist")
+    m = APPLE_RE.search(url)
+    if m:
+        return ("apple", url)
+    m = DEEZER_RE.search(url)
+    if m:
+        return ("deezer", m.group(1))
+    m = SC_RE.search(url)
+    if m:
+        return ("soundcloud", url)
+    m = YT_RE.search(url)
+    if m:
+        return ("youtube", m.group(2))
+    return (None, None)
+
+
+async def handle_single_url(message, url, ctx):
+    """Handle one URL (any supported source)."""
+    loop = asyncio.get_running_loop()
+    action, payload = await classify_url(url)
+    uid = message.from_user.id
+    quality = get_user_quality(uid) or DEFAULT_QUALITY
+
+    if action == "sp_track":
+        await handle_track_request(message, payload, ctx)
+        return True
+    if action == "sp_collection":
+        kind, sid = payload
+        await handle_collection(message, kind, sid, ctx)
+        return True
+    if action == "unsupported":
+        await message.reply_text("لینک آرتیست رو فعلاً ساپورت نمی‌کنم 🥺 لینک آهنگ بفرست.")
+        return True
+    if not action:
+        return False
+    # direct sources: serialize per user
+    async with user_lock(uid):
+        if action == "apple":
+            info = await loop.run_in_executor(None, apple_music_info, payload)
+            if not info:
+                await message.reply_text("نتونستم اطلاعات لینک اپل موزیک رو بگیرم 😕")
+                return True
+            if not get_user_quality(uid):
+                import uuid as _uuid
+                key = _uuid.uuid4().hex[:8]
+                _pending[key] = info
+                await message.reply_text(
+                    f"🎵 {info['artist']} – {info['title']}\nکیفیت رو انتخاب کن:",
+                    reply_markup=quality_keyboard("qam", key))
+                return True
+            await send_track(message.chat_id, info, quality, ctx, reply_to=message)
+        elif action == "deezer":
+            info = await loop.run_in_executor(None, deezer_track_info, payload)
+            if not info:
+                await message.reply_text("نتونستم اطلاعات لینک دیزر رو بگیرم 😕")
+                return True
+            await send_track(message.chat_id, info, quality, ctx, reply_to=message)
+        elif action == "soundcloud":
+            status = await message.reply_text("🎵 دارم اطلاعات ساندکلاد رو می‌گیرم…")
+            info = await loop.run_in_executor(None, soundcloud_info, payload)
+            try:
+                await status.delete()
+            except Exception:
+                pass
+            if not info:
+                await message.reply_text("نتونستم لینک ساندکلاد رو بخونم 😕")
+                return True
+            await send_track(message.chat_id, info, quality, ctx, reply_to=message)
+        elif action == "youtube":
+            info = {"title": "YouTube audio", "artist": "Unknown", "cover_url": None,
+                    "album": None, "year": None, "duration": None, "track_no": None,
+                    "sid": f"yt:{payload}", "ytid": payload}
+            await send_track(message.chat_id, info, quality, ctx, reply_to=message)
+    return True
+
+
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
         return
-    m = SP_RE.search(text)
-    if m:
-        kind, sid = m.group(1), m.group(2)
-        if kind == "track":
-            await handle_track_request(update.message, sid, ctx)
-        elif kind in ("album", "playlist"):
-            await handle_collection(update.message, kind, sid, ctx)
-        elif kind == "artist":
-            await update.message.reply_text("لینک آرتیست رو فعلاً ساپورت نمی‌کنم 🥺 لینک آهنگ بفرست.")
-        return
-    ym = YT_RE.search(text)
-    if ym:
-        vid = ym.group(2)
-        info = {"title": "YouTube audio", "artist": "Unknown", "cover_url": None,
-                "album": None, "year": None, "duration": None, "track_no": None,
-                "sid": f"yt:{vid}", "ytid": vid}
-        quality = get_user_quality(update.message.from_user.id) or DEFAULT_QUALITY
-        await send_track(update.message.chat_id, info, quality, ctx, reply_to=update.message)
-        return
+    urls = URL_RE.findall(text)
+    if urls:
+        recognized = False
+        if len(urls) > 1:
+            await update.message.reply_text(f"📥 {len(urls)} لینک گرفتم، دونه‌دونه دانلود می‌کنم…")
+        for url in urls:
+            action, _ = await classify_url(url)
+            if action:
+                recognized = True
+                await handle_single_url(update.message, url, ctx)
+        if recognized:
+            return
     # plain text -> search
     if len(text) < 2:
         await update.message.reply_text("یه چیزی بنویس دیگه 😅")
@@ -651,6 +874,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send_track(q.message.chat_id, info, quality, ctx, reply_to=q.message)
         return
 
+    if data.startswith("qam:"):
+        # quality chosen for an Apple Music link: qam:<quality>:<key>
+        _, quality, key = data.split(":", 2)
+        await q.edit_message_text(f"⏳ دانلود با کیفیت {quality}kbps…")
+        info = _pending.pop(key, None)
+        if not info:
+            await q.message.reply_text("منقضی شد، لینک رو دوباره بفرست 😕")
+            return
+        await send_track(q.message.chat_id, info, quality, ctx, reply_to=q.message)
+        return
+
     if data.startswith("rq:"):
         # re-download with different quality
         sid = data.split(":", 1)[1]
@@ -674,6 +908,88 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         for p in chunk(f"🎵 {info['artist']} – {info['title']}\n\n{txt}", 4000):
             await q.message.reply_text(p)
+        return
+
+    if data.startswith("tr:"):
+        sid = data.split(":", 1)[1]
+        await q.message.reply_text("🌐 دارم ترجمه می‌کنم…")
+        title = artist = None
+        if sid.startswith("yt:"):
+            await q.message.reply_text("برای این آهنگ اسم دقیق ندارم 😕")
+            return
+        elif sid.startswith("am:"):
+            info = await loop.run_in_executor(None, apple_music_info, f"https://music.apple.com/x/y/{sid[3:]}")
+            if info:
+                title, artist = info["title"], info["artist"]
+        elif sid.startswith("dz:"):
+            info = await loop.run_in_executor(None, deezer_track_info, sid[3:])
+            if info:
+                title, artist = info["title"], info["artist"]
+        elif sid.startswith("sc:"):
+            sc_url = _pending.get("sc" + sid[3:], "")
+            info = await loop.run_in_executor(None, soundcloud_info, sc_url) if sc_url else None
+            if info:
+                title, artist = info["title"], info["artist"]
+        else:
+            info = await loop.run_in_executor(None, spotify_track_info, sid)
+            if info:
+                title, artist = info["title"], info["artist"]
+        if not title:
+            await q.message.reply_text("نتونستم اسم آهنگ رو بگیرم 😕")
+            return
+        txt = await loop.run_in_executor(None, get_lyrics, title, artist)
+        if not txt:
+            await q.message.reply_text("متنی پیدا نشد که ترجمه کنم 😕")
+            return
+        fa = await loop.run_in_executor(None, translate_text, txt)
+        if not fa:
+            await q.message.reply_text("ترجمه ناموفق بود 😕")
+            return
+        for p in chunk(f"🌐 ترجمه «{title}»\n\n{fa}", 4000):
+            await q.message.reply_text(p)
+        return
+
+    if data.startswith("lrc:"):
+        sid = data.split(":", 1)[1]
+        await q.message.reply_text("📄 دارم فایل LRC رو می‌سازم…")
+        title = artist = None
+        if sid.startswith("yt:"):
+            await q.message.reply_text("برای این آهنگ اسم دقیق ندارم 😕")
+            return
+        elif sid.startswith("dz:"):
+            info = await loop.run_in_executor(None, deezer_track_info, sid[3:])
+            if info:
+                title, artist = info["title"], info["artist"]
+        elif sid.startswith("sc:"):
+            sc_url = _pending.get("sc" + sid[3:], "")
+            info = await loop.run_in_executor(None, soundcloud_info, sc_url) if sc_url else None
+            if info:
+                title, artist = info["title"], info["artist"]
+        else:
+            info = await loop.run_in_executor(None, spotify_track_info, sid)
+            if info:
+                title, artist = info["title"], info["artist"]
+        if not title:
+            await q.message.reply_text("نتونستم اسم آهنگ رو بگیرم 😕")
+            return
+        lrc = await loop.run_in_executor(None, get_synced_lyrics, title, artist)
+        if not lrc:
+            await q.message.reply_text("متن همگام‌شده برای این آهنگ پیدا نشد 😕")
+            return
+        tmpd = tempfile.mkdtemp(prefix="lrc_", dir="/tmp")
+        path = os.path.join(tmpd, f"{artist} - {title}.lrc".replace("/", "_")[:80])
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(lrc)
+            with open(path, "rb") as f:
+                await q.message.reply_document(document=f, filename=os.path.basename(path),
+                                               caption=f"📄 {artist} – {title}")
+        finally:
+            try:
+                os.remove(path)
+                os.rmdir(tmpd)
+            except Exception:
+                pass
         return
 
     if data.startswith(("nc:", "sl:")):
@@ -816,6 +1132,7 @@ def main():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("mystats", mystats_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(InlineQueryHandler(on_inline))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
