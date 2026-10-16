@@ -67,20 +67,32 @@ def spotify_track_info(track_id):
 
 def download_mp3(query, out_mp3):
     import subprocess
-    cmd = ["yt-dlp", "ytsearch1:" + query, "-x", "--audio-format", "mp3",
-           "--ffmpeg-location", FF, "-o", out_mp3.replace(".mp3", ".%(ext)s"),
-           "--no-playlist", "-q", "--js-runtimes", "node",
-           "--extractor-args", "youtube:player_client=android"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    if not os.path.exists(out_mp3):
+    base_cmd = ["yt-dlp", "ytsearch1:" + query, "-x", "--audio-format", "mp3",
+                "--ffmpeg-location", FF, "-o", out_mp3.replace(".mp3", ".%(ext)s"),
+                "--no-playlist", "-q", "--js-runtimes", "node"]
+    # YouTube keeps breaking player clients; try several in order.
+    client_variants = [
+        ["--extractor-args", "youtube:player_client=ios,android"],
+        ["--extractor-args", "youtube:player_client=android,web"],
+        [],  # yt-dlp smart defaults as last resort
+    ]
+    last_err = ""
+    for extra in client_variants:
+        r = subprocess.run(base_cmd + extra, capture_output=True, text=True, timeout=300)
+        if os.path.exists(out_mp3):
+            return out_mp3
         # yt-dlp may append .mp3 to template already ending .mp3? check siblings
         base = os.path.dirname(out_mp3)
-        cands = [os.path.join(base, f) for f in os.listdir(base) if f.endswith(".mp3")]
+        try:
+            cands = [os.path.join(base, f) for f in os.listdir(base) if f.endswith(".mp3")]
+        except Exception:
+            cands = []
         if cands:
             os.rename(cands[0], out_mp3)
-        else:
-            raise RuntimeError("yt-dlp failed: " + (r.stderr or r.stdout)[-500:])
-    return out_mp3
+            return out_mp3
+        last_err = (r.stderr or r.stdout)[-500:]
+        log.warning("yt-dlp attempt %s failed: %s", extra, last_err[-200:])
+    raise RuntimeError("yt-dlp failed: " + last_err)
 
 
 def tag_mp3(path, title, artist, cover_bytes=None):
