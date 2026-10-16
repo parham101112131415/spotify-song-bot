@@ -69,7 +69,7 @@ def download_mp3(query, out_mp3):
     import subprocess
     base_cmd = ["yt-dlp", "ytsearch1:" + query, "-x", "--audio-format", "mp3",
                 "--ffmpeg-location", FF, "-o", out_mp3.replace(".mp3", ".%(ext)s"),
-                "--no-playlist", "-q", "--js-runtimes", "node"]
+                "--no-playlist", "-q", "--js-runtimes", "deno,node"]
     # YouTube keeps breaking player clients; try several in order.
     client_variants = [
         ["--extractor-args", "youtube:player_client=ios,android"],
